@@ -18,10 +18,21 @@ keyset is greater than that checkpoint's keyset is retained, while the
 checkpoint boundary itself (the last reading it already covered) and every
 reading before it can never be returned by any resume and is deletable.
 
+The earliest checkpoint is determined by its **immutable captured keyset**
+``(last_observed_at, last_source_id, last_seq)`` -- never by
+``stream_offset``.  The offset is a plain row count taken at creation time,
+so it *shrinks* once an earlier retention run has deleted the rows it
+counted: a checkpoint created after such a cleanup can record a smaller
+offset than an older checkpoint whose captured keyset is actually earlier in
+the stream.  Ordering by offset would then pick the newer checkpoint as
+"earliest" and delete readings the older one still resumes into.  The
+captured keyset, by contrast, is written once and never changes, and the
+protected sets are nested by it, so the smallest keyset covers every later
+checkpoint.  A checkpoint captured on an empty stream (null keyset) sorts
+before every non-empty one and therefore protects *all* published readings.
+
 When the session has no checkpoint at all no resume can be served, so no
-published reading is protected.  A checkpoint captured on an empty stream
-(``stream_offset = 0``, null keyset) protects *every* published reading:
-resuming from it starts at the beginning.
+published reading is protected.
 
 Dry runs derive all counts in one deferred read snapshot and write nothing.
 Confirmation executes the candidate deletes in a single serialised
@@ -53,15 +64,20 @@ def _earliest_checkpoint(
 ) -> Optional[sqlite3.Row]:
     """The checkpoint whose resume window is furthest back in the stream.
 
-    Ordering is by the captured stream position (offset, then the
-    deterministic keyset); ``name`` only breaks the tie for distinct
-    checkpoints taken at the exact same position.  Retaining everything this
-    checkpoint can still read trivially covers every later one.
+    Ordering is by the **immutable** captured keyset ``(last_observed_at,
+    last_source_id, last_seq)`` -- never by ``stream_offset``: retention
+    deletes published rows, so a checkpoint created after an earlier cleanup
+    can record a *smaller* offset than an older checkpoint whose captured
+    keyset is actually earlier in the stream.  Only the keyset identifies
+    the resume position reliably across cleanups.  NULL keysets (checkpoints
+    captured on an empty stream) sort first, so they always win and protect
+    every published reading; ``name`` only breaks the tie for distinct
+    checkpoints captured at the exact same position.  Retaining everything
+    this checkpoint can still read trivially covers every later one.
     """
     return conn.execute(
         "SELECT * FROM checkpoints WHERE session_id = ?"
-        " ORDER BY stream_offset ASC,"
-        " last_observed_at ASC,"
+        " ORDER BY last_observed_at ASC,"
         " last_source_id ASC,"
         " last_seq ASC,"
         " name ASC"

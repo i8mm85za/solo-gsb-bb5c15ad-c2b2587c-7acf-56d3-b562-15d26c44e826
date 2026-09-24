@@ -28,7 +28,10 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
 旧读数的存储空间：它只把**事件时间严格早于**给定 `cutoff` 且状态为
 `published`/`quarantined` 的读数作为候选（`buffered` 永不参与）；隔离候选可直接删除，
 而已发布候选中凡是**会话最早检查点仍可能在续读时读到**的一律保留，并在响应中返回该
-“检查点保护边界”。`dry_run=true` 只报告候选/保留/可删除数量，`dry_run=false` 在
+“检查点保护边界”。最早检查点按**不可变捕获键** `(last_observed_at, last_source_id,
+last_seq)` 判定（空流检查点永远最靠前、保护全部后续记录），不随清理删除行数而变化，
+因此跨多轮清理与后续新建检查点保护边界仍然正确，预览与执行使用同一规则。
+`dry_run=true` 只报告候选/保留/可删除数量，`dry_run=false` 在
 **同一个 `BEGIN IMMEDIATE` 写事务**内原子删除；重复请求幂等，失败整体回滚，
 且不改变水位线、告警与检查点的任何语义。
 
@@ -104,7 +107,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 386 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 390 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -567,8 +570,12 @@ curl -s 'localhost:8000/sessions/lab-1/release-plan?count=2'
 
 **检查点保护规则（仅作用于 published 候选）**：检查点续读返回确定顺序键
 `(observed_at, source_id, seq)` **严格大于**检查点捕获键的全部已发布读数。因此只需保留
-**会话最早检查点**（按捕获位置 `(stream_offset, last_observed_at, last_source_id,
-last_seq)` 排序最靠前者）还可能读到的读数：
+**会话最早检查点**还可能读到的读数。最早检查点按**不可变捕获键**
+`(last_observed_at, last_source_id, last_seq)` 排序取最靠前者（捕获键完全相同的检查点
+按名称破并，保护集合相同）；**绝不使用 `stream_offset` 比较先后**——偏移只是创建时的
+行数快照，某轮清理删除行之后，新建检查点的偏移会小于旧检查点，但其捕获键在流上更晚，
+若按偏移选"最早"会误删旧检查点仍要续读的记录。各检查点的保护集合按捕获键嵌套，
+最小捕获键天然覆盖所有更晚的检查点：
 
 - 已发布候选的键**严格大于**最早检查点键 → **保留**（该检查点续读仍会返回它们，更晚的
   检查点自然也被覆盖）；
@@ -576,8 +583,8 @@ last_seq)` 排序最靠前者）还可能读到的读数：
   再返回；
 - **会话没有任何检查点** → 没有检查点流可服务，全部 published 候选均可删除
   （`protected_by_checkpoint` 为 `null`）；
-- 最早检查点创建于**空流**（`stream_offset=0`、键为 `null`）→ 续读从头开始，**所有**
-  published 读数都受保护；
+- **空流检查点**（`stream_offset=0`、捕获键为 `null`）的捕获键在排序中永远最靠前 →
+  续读从头开始，此后**所有** published 读数都受保护，跨多少轮清理与新建检查点都不变；
 - `quarantined` 候选不属于发布流、检查点永远读不到，**一律可删除**。
 
 响应同时给出总数与分状态明细。`dry_run=true`：
@@ -623,7 +630,11 @@ curl -s -X POST localhost:8000/sessions/lab-1/retention \
 `deletable`），任何失败都整体回滚、数据不变。
 
 - **幂等**：相同请求重复提交，候选已在上次删除，第二次返回 `deleted=0`、`deletable=0`，
-  且再无副作用（两个相同执行并发也被串行化为“一次删除 + 一次空操作”）。
+  且再无副作用（两个相同执行并发也被串行化为”一次删除 + 一次空操作”）。
+- **多轮清理安全**：清理只删行、从不改写检查点；最早保护者按不可变捕获键判定，
+  预览（`dry_run=true`）与执行（`dry_run=false`）使用同一条规则。因此
+  “清理 → 发布新读数 → 新建检查点 → 再清理”反复进行，也不会因新检查点偏移变小而
+  误删旧检查点仍需续读的读数。
 - **语义不变**：清理只删除 `readings` 行；不写 `sessions` / `session_sources` /
   告警表 / `checkpoints`，因此已发布水位线、有效水位线、来源封存/关闭状态、告警当前态
   与历史事件、检查点不可变快照及续读结果全部保持不变（删除只可能让 `/stream` 变短，
@@ -1081,7 +1092,7 @@ curl -s 'localhost:8000/sessions/lab-1/local-spikes?source_id=thermometer-a&from
 │   ├── test_sealing.py      # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
 │   ├── test_checkpoints.py  # 检查点创建/幂等/409/继续读取分页/不可变/迁移测试（39 个）
 │   ├── test_release_plan.py # 释放计划目标水位线/逐来源推进/封存不可达/422/409/并发只读测试（19 个）
-│   ├── test_retention.py    # 检查点安全清理：dry_run/保护边界/原子删除/幂等/不改变既有语义测试（28 个）
+│   ├── test_retention.py    # 检查点安全清理：dry_run/保护边界/原子删除/幂等/多轮清理+新建检查点回归/不改变既有语义测试（32 个）
 │   ├── test_quarantine_audit.py # 隔离影响预演：插入位置/邻居时间差/检查点影响/过滤/400/只读测试（44 个）
 │   └── test_source_gaps.py # 来源缺口扫描：相邻配对/严格阈值/微秒精度/闭区间/游标分页/400/只读测试（29 个）
 │   └── test_arrival_latency.py # 到达延迟剖析：逐来源统计/负延迟/微秒精度/闭区间/空来源/400/只读/单快照测试（19 个）
