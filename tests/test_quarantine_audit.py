@@ -403,6 +403,65 @@ class TestQuarantineAuditCheckpoints:
         for q in audit(c, sid).json()["readings"]:
             assert q["earliest_affected_checkpoint"] is None
 
+    def test_earliest_affected_uses_keyset_not_shrunken_offset(self, client):
+        # After a retention round the offset of a new checkpoint can be
+        # smaller than an older one's; the audit must still name the older
+        # checkpoint whose immutable keyset precedes the insertion slot.
+        c, _ = client
+        sid = "s"
+        create_session(c, session_id=sid, lateness=0.0)
+        # Ladder up to a@10:01:00: five rows published; b@10:00:50 and
+        # a@10:01:00 remain buffered on the watermark.
+        report(c, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": "2026-01-01T10:00:00Z", "value": 1},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T10:00:10Z", "value": 2},
+        ])
+        report(c, sid, [
+            {"source_id": "a", "seq": 2, "observed_at": "2026-01-01T10:00:20Z", "value": 3}])
+        report(c, sid, [
+            {"source_id": "b", "seq": 2, "observed_at": "2026-01-01T10:00:30Z", "value": 4}])
+        report(c, sid, [
+            {"source_id": "a", "seq": 3, "observed_at": "2026-01-01T10:00:40Z", "value": 5}])
+        report(c, sid, [
+            {"source_id": "b", "seq": 3, "observed_at": "2026-01-01T10:00:50Z", "value": 6}])
+        report(c, sid, [
+            {"source_id": "a", "seq": 4, "observed_at": "2026-01-01T10:01:00Z", "value": 7}])
+        # cp-a: offset 5, keyset a@10:00:40.
+        cp_a = checkpoint(c, sid, "cp-a")
+        assert cp_a.json()["stream_offset"] == 5
+        assert cp_a.json()["last_observed_at"] == "2026-01-01T10:00:40Z"
+        # First retention: the five covered rows disappear; buffered rows are
+        # no candidates and stay buffered, so the published stream is empty.
+        r = c.post(f"/sessions/{sid}/retention", json={
+            "cutoff": "2026-12-31T00:00:00Z", "dry_run": False})
+        assert r.json()["deleted"] == 5
+        # Push both clocks: buffered b@10:00:50 and a@10:01:00 publish; the new
+        # pair stays buffered.  Two published rows, both after cp-a's keyset.
+        report(c, sid, [
+            {"source_id": "a", "seq": 5, "observed_at": "2026-01-01T10:01:20Z", "value": 8},
+            {"source_id": "b", "seq": 5, "observed_at": "2026-01-01T10:01:30Z", "value": 9},
+        ])
+        # cp-b: offset 2 on the re-grown stream, a later keyset than cp-a
+        # despite the smaller offset.
+        cp_b = checkpoint(c, sid, "cp-b")
+        assert cp_b.json()["stream_offset"] == 2
+        assert cp_b.json()["last_observed_at"] == "2026-01-01T10:01:00Z"
+        # A late reading slotted after cp-a's keyset but before cp-b's: only
+        # cp-a's resume would gain it regardless of the inverted offsets.
+        r = report(c, sid, [
+            {"source_id": "a", "seq": 90, "observed_at": "2026-01-01T10:00:45Z",
+             "value": 10}])
+        assert r.json()["quarantined"] == 1
+        items = index_items(audit(c, sid).json()["readings"])
+        assert items[("a", 90)]["earliest_affected_checkpoint"] == "cp-a"
+        # A later slot follows both keysets: cp-a is still the earliest.
+        r = report(c, sid, [
+            {"source_id": "a", "seq": 91, "observed_at": "2026-01-01T10:01:05Z",
+             "value": 11}])
+        assert r.json()["quarantined"] == 1
+        items = index_items(audit(c, sid).json()["readings"])
+        assert items[("a", 91)]["earliest_affected_checkpoint"] == "cp-a"
+
 
 class TestQuarantineAuditErrors:
     def test_unknown_session_returns_404(self, client):

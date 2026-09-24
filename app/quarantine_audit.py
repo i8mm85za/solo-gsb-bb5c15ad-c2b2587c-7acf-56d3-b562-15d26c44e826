@@ -18,10 +18,10 @@ so every audit row has exactly one well-defined insertion slot:
   both ``null`` on an empty published stream);
 * ``gap_prev_seconds`` / ``gap_next_seconds`` are the event-time distances
   to those neighbours (``null`` when the neighbour is missing);
-* ``earliest_affected_checkpoint`` names the earliest checkpoint (by
-  captured stream position) whose resume would return the inserted reading,
+* ``earliest_affected_checkpoint`` names the earliest checkpoint (by its
+  immutable captured keyset) whose resume would return the inserted reading,
   i.e. whose captured keyset is strictly smaller than the insertion keyset --
-  an empty-stream checkpoint (null keyset, offset 0) is always affected.
+  an empty-stream checkpoint (null keyset) is always affected.
 
 The whole audit -- quarantined rows, published neighbours, counts and
 checkpoints -- is read inside one deferred SQLite read transaction, so the
@@ -174,8 +174,10 @@ def _earliest_affected_checkpoint(
     exactly when its captured keyset is strictly smaller than the insertion
     keyset -- including the null-keyset (empty-stream) checkpoint, whose
     resume starts at the very first reading.  Checkpoints at or after the
-    slot never see it.  Among the affected ones the earliest by captured
-    stream position is reported.
+    slot never see it.  Among the affected ones the earliest by the
+    immutable captured keyset is reported; the captured stream offset is
+    not consulted because it shrinks with retention deletes and no longer
+    orders checkpoints after a cleanup.
     """
     params_keyset = [observed_at, observed_at, source_id, observed_at, source_id, seq]
     # The checkpoints table stores its captured keyset in the last_* columns.
@@ -187,7 +189,9 @@ def _earliest_affected_checkpoint(
     row = conn.execute(
         "SELECT name FROM checkpoints WHERE session_id = ?"
         f" AND (last_observed_at IS NULL OR {cp_less_sql})"
-        " ORDER BY stream_offset ASC,"
+        # Null keyset (empty stream at capture) first, then the keyset
+        # lexicographically; name only ties apart identical positions.
+        " ORDER BY (last_observed_at IS NOT NULL) ASC,"
         " last_observed_at ASC,"
         " last_source_id ASC,"
         " last_seq ASC,"

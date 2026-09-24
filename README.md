@@ -104,7 +104,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 386 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 390 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -567,8 +567,12 @@ curl -s 'localhost:8000/sessions/lab-1/release-plan?count=2'
 
 **检查点保护规则（仅作用于 published 候选）**：检查点续读返回确定顺序键
 `(observed_at, source_id, seq)` **严格大于**检查点捕获键的全部已发布读数。因此只需保留
-**会话最早检查点**（按捕获位置 `(stream_offset, last_observed_at, last_source_id,
-last_seq)` 排序最靠前者）还可能读到的读数：
+**会话最早检查点**还可能读到的读数。最早保护者**只按不可变的捕获键
+`(last_observed_at, last_source_id, last_seq)` 判定**（`name` 仅在同位置的不同检查点间破并），
+绝不使用 `stream_offset`：偏移只是检查点创建时“当时还在库里”的已发布读数条数，清理会把旧
+检查点已覆盖的行删掉，此后在重新长出来的流上创建的新检查点可能带着**更小**的偏移、捕获键却
+更晚；若按偏移选“最早”，就会误删旧检查点仍应续读到的记录。捕获键在检查点创建时冻结、
+与之后的删除无关：
 
 - 已发布候选的键**严格大于**最早检查点键 → **保留**（该检查点续读仍会返回它们，更晚的
   检查点自然也被覆盖）；
@@ -576,8 +580,9 @@ last_seq)` 排序最靠前者）还可能读到的读数：
   再返回；
 - **会话没有任何检查点** → 没有检查点流可服务，全部 published 候选均可删除
   （`protected_by_checkpoint` 为 `null`）；
-- 最早检查点创建于**空流**（`stream_offset=0`、键为 `null`）→ 续读从头开始，**所有**
-  published 读数都受保护；
+- 最早检查点创建于**空流**（捕获键为 `null`，`stream_offset=0`）→ 它在键序上永远最靠前，
+  因而始终是保护者，续读从头开始、**保护所有后续** published 读数（即使它的偏移 0 小于
+  之后任何检查点的偏移）；
 - `quarantined` 候选不属于发布流、检查点永远读不到，**一律可删除**。
 
 响应同时给出总数与分状态明细。`dry_run=true`：
@@ -663,9 +668,11 @@ curl -s -X POST localhost:8000/sessions/lab-1/retention \
 - `gap_prev_seconds` / `gap_next_seconds`：与前后邻居的**事件时间差（秒）**，无邻居时为
   `null`（与前键同刻时前差为 0）；
 - `earliest_affected_checkpoint`：**最早受影响的检查点名称**。检查点续读返回其捕获键
-  严格之后的已发布读数，因此捕获键严格小于插入键的检查点都会在续读时读到该读数；空流检查点
-  （捕获键为 `null`、偏移 0）从头续读，**总会**受影响。无任何受影响检查点（没有检查点，
-  或全部检查点已越过该插入位置）时为 `null`。
+  严格之后的已发布读数，因此捕获键严格小于插入键的检查点都会在续读时读到该读数；在这些
+  检查点中按**不可变捕获键** `(last_observed_at, last_source_id, last_seq)` 选出最靠前者
+  （不按 `stream_offset`——清理后新建检查点的偏移可能更小却更晚）。空流检查点
+  （捕获键为 `null`）从头续读，**总会**受影响且永远最靠前。无任何受影响检查点（没有
+  检查点，或全部检查点已越过该插入位置）时为 `null`。
 
 结果按 `(observed_at, source_id, seq)` 排序，过滤为闭区间、顺序稳定。顶层还回显归一化后的
 `source_id`/`from`/`to` 与生效 `limit`，并给出过滤后、limit 前的 `matched` 总数、本页
@@ -1081,8 +1088,8 @@ curl -s 'localhost:8000/sessions/lab-1/local-spikes?source_id=thermometer-a&from
 │   ├── test_sealing.py      # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
 │   ├── test_checkpoints.py  # 检查点创建/幂等/409/继续读取分页/不可变/迁移测试（39 个）
 │   ├── test_release_plan.py # 释放计划目标水位线/逐来源推进/封存不可达/422/409/并发只读测试（19 个）
-│   ├── test_retention.py    # 检查点安全清理：dry_run/保护边界/原子删除/幂等/不改变既有语义测试（28 个）
-│   ├── test_quarantine_audit.py # 隔离影响预演：插入位置/邻居时间差/检查点影响/过滤/400/只读测试（44 个）
+│   ├── test_retention.py    # 检查点安全清理：dry_run/保护边界/跨轮清理偏移倒挂/原子删除/幂等/不改变既有语义测试（31 个）
+│   ├── test_quarantine_audit.py # 隔离影响预演：插入位置/邻居时间差/检查点影响/跨轮清理/过滤/400/只读测试（45 个）
 │   └── test_source_gaps.py # 来源缺口扫描：相邻配对/严格阈值/微秒精度/闭区间/游标分页/400/只读测试（29 个）
 │   └── test_arrival_latency.py # 到达延迟剖析：逐来源统计/负延迟/微秒精度/闭区间/空来源/400/只读/单快照测试（19 个）
 │   └── test_exposure.py   # 阈值暴露时长：持有语义/起点继承/同刻 seq/未知区间/value_key/只看已发布/400/只读/单快照测试（47 个）

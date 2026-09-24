@@ -384,6 +384,202 @@ class TestCheckpointProtection:
         assert keys(paged) == [("a", 2), ("b", 2), ("a", 3), ("b", 3)]
 
 
+class TestProtectionAcrossRounds:
+    """The earliest protector is keyed on the immutable captured keyset.
+
+    ``stream_offset`` is only the count of published rows present when the
+    checkpoint was created.  Once a cleanup removes the rows an early
+    checkpoint already covered, a checkpoint created on the re-grown stream
+    afterwards carries a *smaller* offset despite its keyset being later; it
+    must never be mistaken for the earliest protector.
+    """
+
+    def test_checkpoint_created_after_cleanup_never_shrinks_protection(self, client):
+        sid = create_session(client)
+        # First three reports of the ladder: two readings published
+        # (a@:00, b@:10); a@:20 is buffered until the next clock push.
+        report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:10Z"},
+        ])
+        report(client, sid, [
+            {"source_id": "a", "seq": 2, "observed_at": "2026-01-01T00:00:20Z"}])
+        report(client, sid, [
+            {"source_id": "b", "seq": 2, "observed_at": "2026-01-01T00:00:30Z"}])
+        # Checkpoint A at this instant: two published, boundary b@:10.
+        cp_a = make_checkpoint(client, sid, "cp-a")
+        assert cp_a.json()["stream_offset"] == 2
+        assert cp_a.json()["last_observed_at"] == "2026-01-01T00:00:10Z"
+        # Continue the ladder so six readings are published in total.
+        report(client, sid, [
+            {"source_id": "a", "seq": 3, "observed_at": "2026-01-01T00:00:40Z"}])
+        report(client, sid, [
+            {"source_id": "b", "seq": 3, "observed_at": "2026-01-01T00:00:50Z"}])
+        report(client, sid, [
+            {"source_id": "a", "seq": 4, "observed_at": "2026-01-01T00:01:00Z"}])
+        report(client, sid, [
+            {"source_id": "b", "seq": 4, "observed_at": "2026-01-01T00:01:10Z"}])
+        assert keys(full_stream(client, sid)) == [
+            ("a", 1), ("b", 1), ("a", 2), ("b", 2), ("a", 3), ("b", 3)]
+
+        # First cleanup round with a far-future cutoff: a@:00 and A's own
+        # boundary b@:10 (already covered) are deletable; the four later rows
+        # are strictly after A's keyset and protected.
+        first = retention(client, sid, "2026-12-31T00:00:00Z", False).json()
+        assert first["deleted"] == 2
+        assert first["protected_by_checkpoint"]["checkpoint_name"] == "cp-a"
+        survivors = [("a", 2), ("b", 2), ("a", 3), ("b", 3)]
+        assert keys(full_stream(client, sid)) == survivors
+        # A's resume window is exactly the four protected rows.
+        assert keys(full_checkpoint_stream(client, sid, "cp-a")) == survivors
+
+        # Publish fresh readings after the survivor tail (they join A's
+        # resume window), then checkpoint B on the post-cleanup stream.
+        report(client, sid, [
+            {"source_id": "a", "seq": 5, "observed_at": "2026-01-01T00:01:20Z"},
+            {"source_id": "b", "seq": 5, "observed_at": "2026-01-01T00:01:30Z"},
+        ])  # wm jumps to :20: the buffered a@01:00 and b@01:10 both publish
+        a_resume = survivors + [("a", 4), ("b", 4)]
+        assert keys(full_stream(client, sid)) == a_resume
+        cp_b = make_checkpoint(client, sid, "cp-b")
+        # B's captured offset (6) is *larger* than A's (2); the offset-
+        # inverted companion test below covers the shrunken-offset case.
+        # Either way B's boundary b@01:10 is later than A's b@:10, so A
+        # stays the earliest protector.
+        assert cp_b.json()["stream_offset"] == 6
+        assert cp_b.json()["last_observed_at"] == "2026-01-01T00:01:10Z"
+        assert keys(full_checkpoint_stream(client, sid, "cp-b")) == []
+        assert keys(full_checkpoint_stream(client, sid, "cp-a")) == a_resume
+
+        # Second cleanup round: cutoff :35 leaves a@:20/b@:30 as candidates,
+        # both strictly after A's boundary -> retained; A is still the
+        # protector even though B is the newest checkpoint.
+        preview = retention(client, sid, "2026-01-01T00:00:35Z", True).json()
+        assert preview["protected_by_checkpoint"]["checkpoint_name"] == "cp-a"
+        assert preview["protected_by_checkpoint"]["stream_offset"] == 2
+        assert preview["by_status"]["published"] == {
+            "candidates": 2, "retained": 2, "deletable": 0}
+        assert preview["deleted"] == 0
+        executed = retention(client, sid, "2026-01-01T00:00:35Z", False).json()
+        assert executed["deleted"] == 0
+        assert keys(full_stream(client, sid)) == a_resume
+        assert keys(full_checkpoint_stream(client, sid, "cp-a")) == a_resume
+
+    def test_new_checkpoint_with_smaller_offset_never_governs(self, client):
+        """The exact reported bug: B's stream_offset is smaller than A's after
+        a cleanup, but B's keyset is later -- B must not become the protector.
+        """
+        sid = create_session(client)
+        # Drive the ladder up to a@01:00: five rows published (a@:00..a@:40);
+        # b@:50 is buffered until the next clock push and a@01:00 sits on the
+        # watermark, also buffered.
+        report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:10Z"},
+        ])
+        report(client, sid, [
+            {"source_id": "a", "seq": 2, "observed_at": "2026-01-01T00:00:20Z"}])
+        report(client, sid, [
+            {"source_id": "b", "seq": 2, "observed_at": "2026-01-01T00:00:30Z"}])
+        report(client, sid, [
+            {"source_id": "a", "seq": 3, "observed_at": "2026-01-01T00:00:40Z"}])
+        report(client, sid, [
+            {"source_id": "b", "seq": 3, "observed_at": "2026-01-01T00:00:50Z"}])
+        report(client, sid, [
+            {"source_id": "a", "seq": 4, "observed_at": "2026-01-01T00:01:00Z"}])
+        assert keys(full_stream(client, sid)) == [
+            ("a", 1), ("b", 1), ("a", 2), ("b", 2), ("a", 3)]
+        # Checkpoint A: boundary a@:40 (seq 3), offset 5.
+        cp_a = make_checkpoint(client, sid, "cp-a")
+        assert cp_a.json()["stream_offset"] == 5
+        assert cp_a.json()["last_observed_at"] == "2026-01-01T00:00:40Z"
+        assert cp_a.json()["last_source_id"] == "a"
+        assert cp_a.json()["last_seq"] == 3
+
+        # First cleanup: every published row is at or before A's boundary, so
+        # all five disappear (the two buffered readings are no candidates and
+        # stay buffered).
+        first = retention(client, sid, "2026-12-31T00:00:00Z", False).json()
+        assert first["deleted"] == 5
+        assert keys(full_stream(client, sid)) == []
+
+        # Push both clocks: the surviving buffered b@:50 and a@01:00 publish
+        # (both strictly before the new wm :20).  Two rows, both after A's key.
+        report(client, sid, [
+            {"source_id": "a", "seq": 5, "observed_at": "2026-01-01T00:01:20Z"},
+            {"source_id": "b", "seq": 5, "observed_at": "2026-01-01T00:01:30Z"},
+        ])
+        regrown = [("b", 3), ("a", 4)]
+        assert keys(full_stream(client, sid)) == regrown
+
+        # B: offset 2 < A's 5 although its keyset (a@01:00) is strictly later
+        # than A's (a@:40).  The old offset-first ordering chose B here.
+        cp_b = make_checkpoint(client, sid, "cp-b")
+        assert cp_b.json()["stream_offset"] == 2
+        assert cp_b.json()["stream_offset"] < cp_a.json()["stream_offset"]
+        assert cp_b.json()["last_observed_at"] == "2026-01-01T00:01:00Z"
+        assert keys(full_checkpoint_stream(client, sid, "cp-a")) == regrown
+        assert keys(full_checkpoint_stream(client, sid, "cp-b")) == []
+
+        # Second cleanup, preview then execute: A governs, both rows survive.
+        preview = retention(client, sid, "2026-12-31T00:00:00Z", True).json()
+        assert preview["protected_by_checkpoint"]["checkpoint_name"] == "cp-a"
+        assert preview["protected_by_checkpoint"]["stream_offset"] == 5
+        assert preview["by_status"]["published"] == {
+            "candidates": 2, "retained": 2, "deletable": 0}
+        assert preview["deleted"] == 0
+        executed = retention(client, sid, "2026-12-31T00:00:00Z", False).json()
+        assert executed["protected_by_checkpoint"]["checkpoint_name"] == "cp-a"
+        assert executed["deleted"] == 0
+        assert keys(full_stream(client, sid)) == regrown
+        assert keys(full_checkpoint_stream(client, sid, "cp-a")) == regrown
+        assert keys(full_checkpoint_stream(client, sid, "cp-b")) == []
+
+    def test_empty_stream_checkpoint_remains_protector_after_cleanup_rounds(self, client):
+        sid = create_session(client)
+        make_checkpoint(client, sid, "cp-empty")  # null keyset, offset 0
+        # Publish four readings using the ladder cadence.
+        report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:10Z"},
+        ])
+        report(client, sid, [
+            {"source_id": "a", "seq": 2, "observed_at": "2026-01-01T00:00:20Z"}])
+        report(client, sid, [
+            {"source_id": "b", "seq": 2, "observed_at": "2026-01-01T00:00:30Z"}])
+        report(client, sid, [
+            {"source_id": "a", "seq": 3, "observed_at": "2026-01-01T00:00:40Z"}])
+        report(client, sid, [
+            {"source_id": "b", "seq": 3, "observed_at": "2026-01-01T00:00:50Z"}])
+        assert keys(full_stream(client, sid)) == [
+            ("a", 1), ("b", 1), ("a", 2), ("b", 2)]
+        # A later checkpoint on the populated stream has the larger offset.
+        cp_late = make_checkpoint(client, sid, "cp-late")
+        assert cp_late.json()["stream_offset"] == 4
+        assert cp_late.json()["last_observed_at"] == "2026-01-01T00:00:30Z"
+        # First round deletes nothing: the empty-stream checkpoint protects all.
+        first = retention(client, sid, "2026-12-31T00:00:00Z", False).json()
+        assert first["deleted"] == 0
+        assert first["protected_by_checkpoint"]["checkpoint_name"] == "cp-empty"
+        assert first["protected_by_checkpoint"]["last_observed_at"] is None
+        # Publish two more readings (the ladder cadence publishes one per
+        # clock push), create another late checkpoint, and clean again:
+        # cp-empty still protects every subsequent reading.
+        report(client, sid, [
+            {"source_id": "a", "seq": 4, "observed_at": "2026-01-01T00:01:00Z"}])
+        report(client, sid, [
+            {"source_id": "b", "seq": 4, "observed_at": "2026-01-01T00:01:10Z"}])
+        assert keys(full_stream(client, sid)) == [
+            ("a", 1), ("b", 1), ("a", 2), ("b", 2), ("a", 3), ("b", 3)]
+        make_checkpoint(client, sid, "cp-later")
+        preview = retention(client, sid, "2026-12-31T00:00:00Z", True).json()
+        assert preview["protected_by_checkpoint"]["checkpoint_name"] == "cp-empty"
+        assert preview["by_status"]["published"]["deletable"] == 0
+        executed = retention(client, sid, "2026-12-31T00:00:00Z", False).json()
+        assert executed["deleted"] == 0
+        assert len(full_checkpoint_stream(client, sid, "cp-empty")) == 6
+
+
 class TestIdempotency:
     def test_repeated_execution_deletes_nothing_the_second_time(self, client):
         sid = create_session(client)

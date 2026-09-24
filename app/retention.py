@@ -18,6 +18,17 @@ keyset is greater than that checkpoint's keyset is retained, while the
 checkpoint boundary itself (the last reading it already covered) and every
 reading before it can never be returned by any resume and is deletable.
 
+The earliest protector is chosen by the **immutable captured keyset only**
+``(last_observed_at, last_source_id, last_seq)``; a null keyset (checkpoint
+captured on an empty stream) sorts before every other one.  ``stream_offset``
+must never participate in the choice: it is merely the number of published
+rows present when the checkpoint was created, and once retention removes the
+rows an older checkpoint already covered, a checkpoint created afterwards on
+the re-grown stream can carry a *smaller* offset despite its keyset being
+later -- choosing it would delete readings the older checkpoint must still
+resume into.  The keyset, frozen in the checkpoint row at creation, identifies
+the true resume position regardless of intervening deletes.
+
 When the session has no checkpoint at all no resume can be served, so no
 published reading is protected.  A checkpoint captured on an empty stream
 (``stream_offset = 0``, null keyset) protects *every* published reading:
@@ -51,16 +62,21 @@ __all__ = ["apply_retention"]
 def _earliest_checkpoint(
     conn: sqlite3.Connection, session_id: str
 ) -> Optional[sqlite3.Row]:
-    """The checkpoint whose resume window is furthest back in the stream.
+    """The checkpoint whose resume window reaches furthest back in the stream.
 
-    Ordering is by the captured stream position (offset, then the
-    deterministic keyset); ``name`` only breaks the tie for distinct
-    checkpoints taken at the exact same position.  Retaining everything this
-    checkpoint can still read trivially covers every later one.
+    Ordering is by the immutable keyset captured at creation
+    ``(last_observed_at, last_source_id, last_seq)``; ``name`` only breaks
+    the tie between distinct checkpoints taken at the exact same position.
+    The null keyset (empty stream at creation) sorts first and therefore
+    always wins.  ``stream_offset`` is deliberately absent: it counts rows
+    extant at creation and shrinks as retention removes covered readings, so
+    it no longer orders checkpoints chronologically after the first cleanup.
+    Retaining everything this checkpoint can still read covers every later
+    one.
     """
     return conn.execute(
         "SELECT * FROM checkpoints WHERE session_id = ?"
-        " ORDER BY stream_offset ASC,"
+        " ORDER BY (last_observed_at IS NOT NULL) ASC,"
         " last_observed_at ASC,"
         " last_source_id ASC,"
         " last_seq ASC,"
